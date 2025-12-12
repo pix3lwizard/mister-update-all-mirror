@@ -305,22 +305,30 @@ def rewrite_db_urls(db_json, commits_for_db):
 
 def bunny_db_mirror_path_for_db_url(db_url):
     """
-    For a db_url like:
-    https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/main/db.json.zip
-    return a mirror path like:
-    MiSTer-devel/Distribution_MiSTer/main/db.json.zip
+    Map an original db_url to a path in Bunny Storage.
+
+    GitHub raw URLs:
+      https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/main/db.json.zip
+    -> MiSTer-devel/Distribution_MiSTer/main/db.json.zip
+
+    Other hosts (e.g. Aitor's):
+      https://www.aitorgomez.net/static/mistermain/db.json.zip
+    -> www.aitorgomez.net/static/mistermain/db.json.zip
     """
     p = urlparse(db_url)
-    if "raw.githubusercontent.com" not in p.netloc:
-        # you could choose to ignore or special-case other hosts later
-        raise ValueError(f"Unsupported db_url host: {db_url}")
-
     parts = [x for x in p.path.split("/") if x]
-    if len(parts) < 4:
-        raise ValueError(f"Unexpected db_url path: {db_url}")
-    owner, repo, branch = parts[0], parts[1], parts[2]
-    filename = parts[-1]
-    return str(PurePosixPath(owner) / repo / branch / filename)
+
+    # GitHub raw case: mirror the repo structure
+    if "raw.githubusercontent.com" in p.netloc:
+        if len(parts) < 4:
+            raise ValueError(f"Unexpected db_url path: {db_url}")
+        owner, repo, branch = parts[0], parts[1], parts[2]
+        filename = parts[-1]
+        return str(PurePosixPath(owner) / repo / branch / filename)
+
+    # Generic fallback: host + full path
+    host = p.netloc
+    return str(PurePosixPath(host, *parts))
 
 def prune_old_commits(owner, repo, keep=3):
     """
