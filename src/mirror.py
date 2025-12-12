@@ -303,11 +303,19 @@ def prune_old_commits(owner, repo, keep=3):
 
 def main():
     upstream = load_upstream_databases_module()
+    
+    # Discover all DB entries from upstream
+    all_entries = [name for name, _ in iter_all_db_entries(upstream)]
+    print("AllDBs entries:", all_entries)
+
+    # Build a filter that targets any DB whose name looks like Distribution_MiSTer
+    db_filter = {n.lower() for n in all_entries if "distribution" in n.lower()}
+    print("Using db_filter:", db_filter)
 
     # For initial testing, you *might* want to restrict to just Distribution_MiSTer:
     # db_filter = {"distribution_mister"}
     #db_filter = None  # or a set of names in AllDBs.*
-    db_filter = {"distribution_mister"}
+    #db_filter = {"distribution_mister"}
 
     for name, db in iter_all_db_entries(upstream):
         if db_filter and name.lower() not in db_filter:
