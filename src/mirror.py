@@ -35,14 +35,18 @@ def http_put_to_bunny(dest_path, data):
     access_key = os.environ["BUNNY_ACCESS_KEY"]
     host = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
 
-    # Ensure no leading slash in dest_path so we don't get double slashes
-    dest = dest_path.lstrip("/")
+    # dest_path might be a pathlib.PurePosixPath; normalize to string
+    dest = str(dest_path).lstrip("/")
 
     url = f"https://{host}/{zone}/{dest}"
-    print(f"[PUT] {url}")  # keep this for debugging/logging
+    print(f"[PUT] {url}")
 
     r = requests.put(url, data=data, headers={"AccessKey": access_key})
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        print(f"[ERROR] Bunny responded with {resp.status_code}: {resp.text[:200]}")
+        raise
 
 
 def list_bunny_directory(path):
