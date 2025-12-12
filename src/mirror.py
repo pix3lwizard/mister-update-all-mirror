@@ -72,7 +72,7 @@ def list_bunny_directory(path):
         return r.json()
     except Exception:
         return []
-
+        
 def bunny_object_exists(path):
     """
     Return True if a given object exists in Bunny Storage, False if 404.
