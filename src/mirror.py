@@ -8,6 +8,7 @@ import types
 import importlib.util
 from urllib.parse import urlparse
 from pathlib import PurePosixPath
+from datetime import datetime
 
 import requests
 
@@ -77,6 +78,26 @@ def list_bunny_directory(path):
         return r.json()
     except Exception:
         return []
+
+
+def bunny_object_exists(path):
+    """
+    Return True if a given object exists in Bunny Storage, False if 404.
+    """
+    zone = os.environ["BUNNY_STORAGE_ZONE"]
+    access_key = os.environ["BUNNY_ACCESS_KEY"]
+    host = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
+
+    obj = str(path).lstrip("/")
+    url = f"https://{host}/{zone}/{obj}"
+    headers = {"AccessKey": access_key}
+
+    print(f"[HEAD] {url}")
+    resp = requests.head(url, headers=headers, timeout=30)
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    return True
 
 
 def delete_bunny_path(path):
@@ -199,7 +220,18 @@ def mirror_repo_commit(owner, repo, ref):
     """
     Download the zipball of (owner, repo, ref), unpack, upload to Bunny under:
     /owner/repo/ref/<files...>
+
+    Uses a .mirrored.json marker under that ref directory to avoid re-uploading
+    the same commit on subsequent runs.
     """
+    base_dir = PurePosixPath(owner) / repo / ref
+    marker_path = base_dir / ".mirrored.json"
+
+    # If we've already mirrored this commit once, skip it
+    if bunny_object_exists(marker_path):
+        print(f"[SKIP] {owner}/{repo}@{ref} already mirrored (marker present)")
+        return
+
     zip_url = GITHUB_ZIPBALL_TEMPLATE.format(owner=owner, repo=repo, ref=ref)
     headers = {}
     gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -208,6 +240,7 @@ def mirror_repo_commit(owner, repo, ref):
 
     resp = http_get(zip_url, headers=headers)
     zdata = io.BytesIO(resp.content)
+
     with zipfile.ZipFile(zdata) as zf:
         # zipball has a single top-level directory like owner-repo-<hash>/
         for name in zf.namelist():
@@ -219,8 +252,21 @@ def mirror_repo_commit(owner, repo, ref):
                 rel_path = parts[0]
             else:
                 rel_path = parts[1]
-            dest_path = PurePosixPath(owner) / repo / ref / rel_path
+            dest_path = base_dir / rel_path
             http_put_to_bunny(dest_path, data)
+
+    # If we reached here, uploads completed for this commit.
+    marker = {
+        "owner": owner,
+        "repo": repo,
+        "ref": ref,
+        "mirrored_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    http_put_to_bunny(
+        marker_path,
+        json.dumps(marker, indent=2).encode("utf-8"),
+    )
+    print(f"[MARK] wrote {marker_path} for {owner}/{repo}@{ref}")
 
 
 def rewrite_db_urls(db_json, commits_for_db):
