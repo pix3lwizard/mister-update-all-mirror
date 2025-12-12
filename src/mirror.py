@@ -141,7 +141,6 @@ def parse_raw_github_base(url):
     return owner, repo, ref
 
 
-
 def collect_commits_from_db(db_json):
     commits = set()
 
@@ -159,6 +158,9 @@ def collect_commits_from_db(db_json):
 
     # 3. zips[*].summary_file / contents_file
     for zip_entry in db_json.get("zips", []):
+        # Some DBs use strings or other types here; only handle dicts.
+        if not isinstance(zip_entry, dict):
+            continue
         for key in ("summary_file", "contents_file"):
             url = zip_entry.get(key)
             parsed = parse_raw_github_base(url) if url else None
@@ -166,14 +168,13 @@ def collect_commits_from_db(db_json):
                 commits.add(parsed)
 
     # 4. If no base_files_url, infer from first file url
-    if not commits:
-        files = db_json.get("files", [])
-        if files:
-            first = files[0]
-            url = first.get("url") or first.get("file") or ""
-            parsed = parse_raw_github_base(url)
-            if parsed:
-                commits.add(parsed)
+    files = [f for f in db_json.get("files", []) if isinstance(f, dict)]
+    if not commits and files:
+        first = files[0]
+        url = first.get("url") or first.get("file") or ""
+        parsed = parse_raw_github_base(url)
+        if parsed:
+            commits.add(parsed)
 
     return commits
 
