@@ -76,6 +76,8 @@ def list_bunny_directory(path):
 def bunny_object_exists(path):
     """
     Return True if a given object exists in Bunny Storage, False if 404.
+    If Bunny rejects the HEAD (401/403/etc), we log a warning and
+    assume the object does NOT exist so the mirror can proceed.
     """
     obj = str(path).lstrip("/")
     url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{obj}"
@@ -83,8 +85,21 @@ def bunny_object_exists(path):
 
     print(f"[HEAD] {url}")
     resp = requests.head(url, headers=headers, timeout=30)
+
+    # Not found → definitely doesn't exist
     if resp.status_code == 404:
         return False
+
+    # Auth / permission weirdness → don't crash the mirror job
+    if resp.status_code in (401, 403):
+        msg = (resp.text or "")[:200]
+        print(
+            f"[WARN] Bunny HEAD {url} returned {resp.status_code}; "
+            f"treating as 'not mirrored yet'. Response: {msg!r}"
+        )
+        return False
+
+    # Anything else unexpected → bubble up
     resp.raise_for_status()
     return True
 
@@ -356,6 +371,8 @@ def prune_old_commits(owner, repo, keep=3):
         delete_bunny_path(f"{owner}/{repo}/{ref}/")
 
 def main():
+    print(f"Using Bunny host: {BUNNY_STORAGE_HOST}")
+    print(f"Using Bunny zone: {BUNNY_STORAGE_ZONE}")
     upstream = load_upstream_databases_module()
     
     # Discover all DB entries from upstream
