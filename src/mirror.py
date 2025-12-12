@@ -30,7 +30,7 @@ def http_get(url, **kwargs):
     return r
 
 
-def http_put_to_bunny(dest_path, data):
+def http_put_to_bunny(dest_path, data, content_type=None):
     zone = os.environ["BUNNY_STORAGE_ZONE"]
     access_key = os.environ["BUNNY_ACCESS_KEY"]
     host = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
@@ -41,12 +41,24 @@ def http_put_to_bunny(dest_path, data):
     url = f"https://{host}/{zone}/{dest}"
     print(f"[PUT] {url}")
 
-    r = requests.put(url, data=data, headers={"AccessKey": access_key})
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        print(f"[ERROR] Bunny responded with {resp.status_code}: {resp.text[:200]}")
-        raise
+    headers = {"AccessKey": access_key}
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    resp = requests.put(url, data=data, headers=headers, timeout=60)
+
+    # Some filenames (weird chars, etc.) can trigger Bunny 400s; don't kill the whole run
+    if resp.status_code == 400:
+        msg = (resp.text or "")[:200]
+        print(f"[WARN] Bunny 400 Bad Request for {url}: {msg!r} – skipping this object")
+        return
+
+    if not resp.ok:
+        msg = (resp.text or "")[:200]
+        print(f"[ERROR] Bunny responded with {resp.status_code} for {url}: {msg!r}")
+        resp.raise_for_status()
+
+    return resp
 
 
 def list_bunny_directory(path):
