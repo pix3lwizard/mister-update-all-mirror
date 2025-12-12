@@ -21,6 +21,7 @@ GITHUB_ZIPBALL_TEMPLATE = "https://api.github.com/repos/{owner}/{repo}/zipball/{
 
 BUNNY_STORAGE_ZONE = os.environ["BUNNY_STORAGE_ZONE"]
 BUNNY_ACCESS_KEY = os.environ["BUNNY_ACCESS_KEY"]
+BUNNY_STORAGE_HOST = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
 MIRROR_BASE_URL = os.environ["MIRROR_BASE_URL"].rstrip("/")
 
 
@@ -30,25 +31,20 @@ def http_get(url, **kwargs):
     r.raise_for_status()
     return r
 
-
 def http_put_to_bunny(dest_path, data, content_type=None):
-    zone = os.environ["BUNNY_STORAGE_ZONE"]
-    access_key = os.environ["BUNNY_ACCESS_KEY"]
-    host = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
-
-    # dest_path might be a pathlib.PurePosixPath; normalize to string
+    # Normalize path
     dest = str(dest_path).lstrip("/")
 
-    url = f"https://{host}/{zone}/{dest}"
+    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}"
     print(f"[PUT] {url}")
 
-    headers = {"AccessKey": access_key}
+    headers = {"AccessKey": BUNNY_ACCESS_KEY}
     if content_type:
         headers["Content-Type"] = content_type
 
     resp = requests.put(url, data=data, headers=headers, timeout=60)
 
-    # Some filenames (weird chars, etc.) can trigger Bunny 400s; don't kill the whole run
+    # Some filenames can trigger Bunny 400s; log and skip those objects
     if resp.status_code == 400:
         msg = (resp.text or "")[:200]
         print(f"[WARN] Bunny 400 Bad Request for {url}: {msg!r} – skipping this object")
@@ -66,8 +62,8 @@ def list_bunny_directory(path):
     """
     List files in a Bunny Storage directory, returns JSON (list of objects with 'ObjectName', etc.)
     """
-    dir_path = str(PurePosixPath(path))
-    url = f"https://storage.bunnycdn.com/{BUNNY_STORAGE_ZONE}/{dir_path}"
+    dir_path = str(PurePosixPath(path)).lstrip("/")
+    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dir_path}"
     print(f"[LIST] {url}")
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
     r = requests.get(url, headers=headers, timeout=60)
@@ -101,7 +97,8 @@ def bunny_object_exists(path):
 
 
 def delete_bunny_path(path):
-    url = f"https://storage.bunnycdn.com/{BUNNY_STORAGE_ZONE}/{path}"
+    obj = str(path).lstrip("/")
+    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{obj}"
     print(f"[DELETE] {url}")
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
     r = requests.delete(url, headers=headers, timeout=60)
