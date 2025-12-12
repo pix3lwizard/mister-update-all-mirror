@@ -122,9 +122,11 @@ def parse_raw_github_base(url):
     """
     Given something like:
     https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/8323352e.../some/path/
-    return (owner, repo, ref)
+    return (owner, repo, ref).
+
+    Returns None if the value is not a string or not a raw.githubusercontent.com URL.
     """
-    if not url:
+    if not url or not isinstance(url, str):
         return None
 
     p = urlparse(url)
@@ -137,6 +139,7 @@ def parse_raw_github_base(url):
 
     owner, repo, ref = parts[0], parts[1], parts[2]
     return owner, repo, ref
+
 
 
 def collect_commits_from_db(db_json):
