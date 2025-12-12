@@ -24,7 +24,6 @@ BUNNY_ACCESS_KEY = os.environ["BUNNY_ACCESS_KEY"]
 BUNNY_STORAGE_HOST = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
 MIRROR_BASE_URL = os.environ["MIRROR_BASE_URL"].rstrip("/")
 
-
 def http_get(url, **kwargs):
     print(f"[GET] {url}")
     r = requests.get(url, timeout=60, **kwargs)
@@ -57,7 +56,6 @@ def http_put_to_bunny(dest_path, data, content_type=None):
 
     return resp
 
-
 def list_bunny_directory(path):
     """
     List files in a Bunny Storage directory, returns JSON (list of objects with 'ObjectName', etc.)
@@ -75,18 +73,13 @@ def list_bunny_directory(path):
     except Exception:
         return []
 
-
 def bunny_object_exists(path):
     """
     Return True if a given object exists in Bunny Storage, False if 404.
     """
-    zone = os.environ["BUNNY_STORAGE_ZONE"]
-    access_key = os.environ["BUNNY_ACCESS_KEY"]
-    host = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
-
     obj = str(path).lstrip("/")
-    url = f"https://{host}/{zone}/{obj}"
-    headers = {"AccessKey": access_key}
+    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{obj}"
+    headers = {"AccessKey": BUNNY_ACCESS_KEY}
 
     print(f"[HEAD] {url}")
     resp = requests.head(url, headers=headers, timeout=30)
@@ -94,7 +87,6 @@ def bunny_object_exists(path):
         return False
     resp.raise_for_status()
     return True
-
 
 def delete_bunny_path(path):
     obj = str(path).lstrip("/")
@@ -104,7 +96,6 @@ def delete_bunny_path(path):
     r = requests.delete(url, headers=headers, timeout=60)
     if r.status_code not in (200, 204, 404):
         r.raise_for_status()
-
 
 def load_upstream_databases_module():
     """
@@ -133,7 +124,6 @@ def iter_all_db_entries(upstream_mod):
         if hasattr(db, "db_url"):
             yield attr, db
 
-
 def download_db_json(db_url):
     """
     Download a DB from db_url.
@@ -150,7 +140,6 @@ def download_db_json(db_url):
             return json.loads(data.decode("utf-8")), content, True
     else:
         return json.loads(resp.text), content, False
-
 
 def parse_raw_github_base(url):
     """
@@ -173,7 +162,6 @@ def parse_raw_github_base(url):
 
     owner, repo, ref = parts[0], parts[1], parts[2]
     return owner, repo, ref
-
 
 def collect_commits_from_db(db_json):
     commits = set()
@@ -211,7 +199,6 @@ def collect_commits_from_db(db_json):
             commits.add(parsed)
 
     return commits
-
 
 def mirror_repo_commit(owner, repo, ref):
     """
@@ -265,7 +252,6 @@ def mirror_repo_commit(owner, repo, ref):
     )
     print(f"[MARK] wrote {marker_path} for {owner}/{repo}@{ref}")
 
-
 def rewrite_db_urls(db_json, commits_for_db):
     """
     Return a new DB JSON where:
@@ -317,7 +303,6 @@ def rewrite_db_urls(db_json, commits_for_db):
 
     return new_db
 
-
 def bunny_db_mirror_path_for_db_url(db_url):
     """
     For a db_url like:
@@ -336,7 +321,6 @@ def bunny_db_mirror_path_for_db_url(db_url):
     owner, repo, branch = parts[0], parts[1], parts[2]
     filename = parts[-1]
     return str(PurePosixPath(owner) / repo / branch / filename)
-
 
 def prune_old_commits(owner, repo, keep=3):
     """
@@ -362,7 +346,6 @@ def prune_old_commits(owner, repo, keep=3):
     to_delete = refs[0 : len(refs) - keep]
     for ref in to_delete:
         delete_bunny_path(f"{owner}/{repo}/{ref}/")
-
 
 def main():
     upstream = load_upstream_databases_module()
@@ -432,7 +415,5 @@ def main():
         http_put_to_bunny(meta_path, json.dumps(meta, indent=2).encode("utf-8"),
                           content_type="application/json")
 
-
 if __name__ == "__main__":
     main()
-
