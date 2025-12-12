@@ -30,18 +30,18 @@ def http_get(url, **kwargs):
     return r
 
 
-def http_put_to_bunny(path, data, content_type="application/octet-stream"):
-    """
-    Upload a single file to Bunny Storage at /<zone>/<path>.
-    """
-    path = str(PurePosixPath(path))
-    url = f"https://storage.bunnycdn.com/{BUNNY_STORAGE_ZONE}/{path}"
-    print(f"[PUT] {url}")
-    headers = {
-        "AccessKey": BUNNY_ACCESS_KEY,
-        "Content-Type": content_type,
-    }
-    r = requests.put(url, headers=headers, data=data, timeout=120)
+def http_put_to_bunny(dest_path, data):
+    zone = os.environ["BUNNY_STORAGE_ZONE"]
+    access_key = os.environ["BUNNY_ACCESS_KEY"]
+    host = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
+
+    # Ensure no leading slash in dest_path so we don't get double slashes
+    dest = dest_path.lstrip("/")
+
+    url = f"https://{host}/{zone}/{dest}"
+    print(f"[PUT] {url}")  # keep this for debugging/logging
+
+    r = requests.put(url, data=data, headers={"AccessKey": access_key})
     r.raise_for_status()
 
 
