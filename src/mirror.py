@@ -479,10 +479,21 @@ def main():
     print("AllDBs entries:", all_entries)
 
     # Build a filter that targets any DB whose name looks like Distribution_MiSTer
-    db_filter = {n.lower() for n in all_entries if "distribution" in n.lower()}
+    #db_filter = {n.lower() for n in all_entries if "distribution" in n.lower()}
+    #print("Using db_filter:", db_filter)
+    # For tighter testing, you could temporarily do:
+    # db_filter = {"distribution_mister"}
+    
+    # Discover all DB entries from upstream
+    all_entries = [name for name, _ in iter_all_db_entries(upstream)]
+    print("AllDBs entries:", all_entries)
+
+    # No filter: process *all* DBs from AllDBs
+    db_filter = None
     print("Using db_filter:", db_filter)
     # For tighter testing, you could temporarily do:
     # db_filter = {"distribution_mister"}
+
 
     for name, db in iter_all_db_entries(upstream):
         if db_filter and name.lower() not in db_filter:
