@@ -2,7 +2,6 @@
 import io
 import json
 import os
-import re
 import zipfile
 import types
 import importlib.util
@@ -12,28 +11,35 @@ from datetime import datetime
 
 import requests
 
+# Upstream "source of truth" for DB definitions
 UPSTREAM_DATABASES_URL = (
     "https://raw.githubusercontent.com/theypsilon/Update_All_MiSTer/"
     "master/src/update_all/databases.py"
 )
 
+# GitHub zipball template for mirroring specific commits
 GITHUB_ZIPBALL_TEMPLATE = "https://api.github.com/repos/{owner}/{repo}/zipball/{ref}"
 
+# Bunny + mirror configuration (provided via GitHub Actions env)
 BUNNY_STORAGE_ZONE = os.environ["BUNNY_STORAGE_ZONE"]
 BUNNY_ACCESS_KEY = os.environ["BUNNY_ACCESS_KEY"]
 BUNNY_STORAGE_HOST = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
 MIRROR_BASE_URL = os.environ["MIRROR_BASE_URL"].rstrip("/")
 
+
 def http_get(url, **kwargs):
     print(f"[GET] {url}")
-    r = requests.get(url, timeout=60, **kwargs)
-    r.raise_for_status()
-    return r
+    resp = requests.get(url, timeout=60, **kwargs)
+    resp.raise_for_status()
+    return resp
+
 
 def http_put_to_bunny(dest_path, data, content_type=None):
-    # Normalize path
+    """
+    Upload a single object to Bunny Storage under:
+      https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}
+    """
     dest = str(dest_path).lstrip("/")
-
     url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}"
     print(f"[PUT] {url}")
 
@@ -43,7 +49,7 @@ def http_put_to_bunny(dest_path, data, content_type=None):
 
     resp = requests.put(url, data=data, headers=headers, timeout=60)
 
-    # Some filenames can trigger Bunny 400s; log and skip those objects
+    # Some filenames may be rejected (400) – log & skip those objects only.
     if resp.status_code == 400:
         msg = (resp.text or "")[:200]
         print(f"[WARN] Bunny 400 Bad Request for {url}: {msg!r} – skipping this object")
@@ -56,26 +62,33 @@ def http_put_to_bunny(dest_path, data, content_type=None):
 
     return resp
 
+
 def list_bunny_directory(path):
     """
-    List files in a Bunny Storage directory, returns JSON (list of objects with 'ObjectName', etc.)
+    List files in a Bunny Storage directory.
+    Returns a list of objects (dicts with ObjectName, IsDirectory, LastChanged, etc.),
+    or [] if the directory doesn't exist.
     """
     dir_path = str(PurePosixPath(path)).lstrip("/")
     url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dir_path}"
     print(f"[LIST] {url}")
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
-    r = requests.get(url, headers=headers, timeout=60)
-    if r.status_code == 404:
+    resp = requests.get(url, headers=headers, timeout=60)
+
+    if resp.status_code == 404:
         return []
-    r.raise_for_status()
+
+    resp.raise_for_status()
     try:
-        return r.json()
+        return resp.json()
     except Exception:
         return []
-        
+
+
 def bunny_object_exists(path):
     """
     Return True if a given object exists in Bunny Storage, False if 404.
+
     If Bunny rejects the HEAD (401/403/etc), we log a warning and
     assume the object does NOT exist so the mirror can proceed.
     """
@@ -100,14 +113,19 @@ def bunny_object_exists(path):
     resp.raise_for_status()
     return True
 
+
 def delete_bunny_path(path):
+    """
+    Delete a file or "directory" path in Bunny Storage.
+    """
     obj = str(path).lstrip("/")
     url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{obj}"
     print(f"[DELETE] {url}")
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
-    r = requests.delete(url, headers=headers, timeout=60)
-    if r.status_code not in (200, 204, 404):
-        r.raise_for_status()
+    resp = requests.delete(url, headers=headers, timeout=60)
+    if resp.status_code not in (200, 204, 404):
+        resp.raise_for_status()
+
 
 def load_upstream_databases_module():
     """
@@ -132,9 +150,9 @@ def iter_all_db_entries(upstream_mod):
         if attr.startswith("_"):
             continue
         db = getattr(all_dbs_cls, attr)
-        # Basic duck-typing: must have db_url
         if hasattr(db, "db_url"):
             yield attr, db
+
 
 def download_db_json(db_url):
     """
@@ -153,10 +171,11 @@ def download_db_json(db_url):
     else:
         return json.loads(resp.text), content, False
 
+
 def parse_raw_github_base(url):
     """
     Given something like:
-    https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/8323352e.../some/path/
+      https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/8323352e.../some/path/
     return (owner, repo, ref).
 
     Returns None if the value is not a string or not a raw.githubusercontent.com URL.
@@ -175,7 +194,11 @@ def parse_raw_github_base(url):
     owner, repo, ref = parts[0], parts[1], parts[2]
     return owner, repo, ref
 
+
 def collect_commits_from_db(db_json):
+    """
+    Collect all (owner, repo, ref) tuples referenced by a DB JSON.
+    """
     commits = set()
 
     # 1. base_files_url
@@ -192,7 +215,6 @@ def collect_commits_from_db(db_json):
 
     # 3. zips[*].summary_file / contents_file
     for zip_entry in db_json.get("zips", []):
-        # Some DBs use strings or other types here; only handle dicts.
         if not isinstance(zip_entry, dict):
             continue
         for key in ("summary_file", "contents_file"):
@@ -212,10 +234,11 @@ def collect_commits_from_db(db_json):
 
     return commits
 
+
 def mirror_repo_commit(owner, repo, ref):
     """
     Download the zipball of (owner, repo, ref), unpack, upload to Bunny under:
-    /owner/repo/ref/<files...>
+      /owner/repo/ref/<files...>
 
     Uses a .mirrored.json marker under that ref directory to avoid re-uploading
     the same commit on subsequent runs.
@@ -261,8 +284,10 @@ def mirror_repo_commit(owner, repo, ref):
     http_put_to_bunny(
         marker_path,
         json.dumps(marker, indent=2).encode("utf-8"),
+        content_type="application/json",
     )
     print(f"[MARK] wrote {marker_path} for {owner}/{repo}@{ref}")
+
 
 def rewrite_db_urls(db_json, commits_for_db):
     """
@@ -270,6 +295,7 @@ def rewrite_db_urls(db_json, commits_for_db):
     - base_files_url and any raw.githubusercontent.com URLs pointing to
       known (owner,repo,ref) are rewritten to your mirror.
     """
+
     def rewrite_url(url):
         if not url:
             return url
@@ -303,6 +329,8 @@ def rewrite_db_urls(db_json, commits_for_db):
 
     # zips
     for zip_entry in new_db.get("zips", []):
+        if not isinstance(zip_entry, dict):
+            continue
         if "summary_file" in zip_entry:
             zip_entry["summary_file"] = rewrite_url(zip_entry["summary_file"])
         if "contents_file" in zip_entry:
@@ -310,10 +338,12 @@ def rewrite_db_urls(db_json, commits_for_db):
 
     # files[*].url
     for f in new_db.get("files", []):
-        if "url" in f:
+        # Only rewrite if this entry is a dict with a "url" key
+        if isinstance(f, dict) and "url" in f:
             f["url"] = rewrite_url(f["url"])
 
     return new_db
+
 
 def bunny_db_mirror_path_for_db_url(db_url):
     """
@@ -341,6 +371,7 @@ def bunny_db_mirror_path_for_db_url(db_url):
     # Generic fallback: host + full path
     host = p.netloc
     return str(PurePosixPath(host, *parts))
+
 
 def prune_old_commits(owner, repo, keep=3):
     """
@@ -375,7 +406,7 @@ def prune_old_commits(owner, repo, keep=3):
         print(f"[PRUNE] {len(dirs)} refs under {base_path}, <= keep={keep}; nothing to prune.")
         return
 
-    # Sort newest first by LastChanged (ISO 8601 sorts lexicographically OK)
+    # Sort newest first by LastChanged (ISO 8601 sorts lexicographically ok)
     dirs_sorted = sorted(dirs, key=lambda x: x[2], reverse=True)
 
     # Keep the newest `keep`, prune the rest
@@ -391,11 +422,13 @@ def prune_old_commits(owner, repo, keep=3):
         print(f"[PRUNE] Deleting old ref {ref} (LastChanged={last_changed}) at {full_name}")
         delete_bunny_path(full_name)
 
+
 def main():
     print(f"Using Bunny host: {BUNNY_STORAGE_HOST}")
     print(f"Using Bunny zone: {BUNNY_STORAGE_ZONE}")
+
     upstream = load_upstream_databases_module()
-    
+
     # Discover all DB entries from upstream
     all_entries = [name for name, _ in iter_all_db_entries(upstream)]
     print("AllDBs entries:", all_entries)
@@ -403,11 +436,8 @@ def main():
     # Build a filter that targets any DB whose name looks like Distribution_MiSTer
     db_filter = {n.lower() for n in all_entries if "distribution" in n.lower()}
     print("Using db_filter:", db_filter)
-
-    # For initial testing, you *might* want to restrict to just Distribution_MiSTer:
+    # For tighter testing, you could temporarily do:
     # db_filter = {"distribution_mister"}
-    #db_filter = None  # or a set of names in AllDBs.*
-    #db_filter = {"distribution_mister"}
 
     for name, db in iter_all_db_entries(upstream):
         if db_filter and name.lower() not in db_filter:
@@ -439,7 +469,9 @@ def main():
         # Serialize & zip if the original was zipped
         if is_zipped:
             buf = io.BytesIO()
-            with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(
+                buf, mode="w", compression=zipfile.ZIP_DEFLATED
+            ) as zf:
                 zf.writestr("db.json", json.dumps(new_db_json, separators=(",", ":")))
             new_bytes = buf.getvalue()
             filename = "db.json.zip"
@@ -447,19 +479,25 @@ def main():
             new_bytes = json.dumps(new_db_json, indent=2).encode("utf-8")
             filename = "db.json"
 
-        # Upload mirrored DB to Bunny under mirror-1-like layout
+        # Upload mirrored DB to Bunny under a stable layout
         dest_path = bunny_db_mirror_path_for_db_url(db_url)
         http_put_to_bunny(dest_path, new_bytes, content_type="application/octet-stream")
 
-        # Optional: also upload a small metadata file for debugging
+        # Also upload a small metadata file for debugging
         meta = {
             "name": name,
             "source_db_url": db_url,
-            "mirrored_commits": list(sorted({f"{o}/{r}/{ref}" for (o, r, ref) in commits})),
+            "mirrored_commits": sorted(
+                {f"{o}/{r}/{ref}" for (o, r, ref) in commits}
+            ),
         }
         meta_path = str(PurePosixPath(dest_path).with_suffix(".meta.json"))
-        http_put_to_bunny(meta_path, json.dumps(meta, indent=2).encode("utf-8"),
-                          content_type="application/json")
+        http_put_to_bunny(
+            meta_path,
+            json.dumps(meta, indent=2).encode("utf-8"),
+            content_type="application/json",
+        )
+
 
 if __name__ == "__main__":
     main()
