@@ -483,10 +483,6 @@ def main():
     #print("Using db_filter:", db_filter)
     # For tighter testing, you could temporarily do:
     # db_filter = {"distribution_mister"}
-    
-    # Discover all DB entries from upstream
-    all_entries = [name for name, _ in iter_all_db_entries(upstream)]
-    print("AllDBs entries:", all_entries)
 
     # No filter: process *all* DBs from AllDBs
     db_filter = None
