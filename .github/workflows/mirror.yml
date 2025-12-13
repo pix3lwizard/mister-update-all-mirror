@@ -1,11 +1,27 @@
 name: Mirror Update_All to Bunny
 
 on:
-  workflow_dispatch: {}   # manual trigger only for now
+  # Manual run button
+  workflow_dispatch:
+
+  # Run automatically every 3 hours (José suggested 2–4h)
+  #schedule:
+  #  - cron: "0 */3 * * *"
+
+  # Also run when you change the mirror code or workflow
+  push:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - ".github/workflows/mirror.yml"
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
+
+    concurrency:
+      group: mirror-update-all
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repo

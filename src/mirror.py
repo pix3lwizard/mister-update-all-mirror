@@ -86,11 +86,9 @@ def bunny_object_exists(path):
     print(f"[HEAD] {url}")
     resp = requests.head(url, headers=headers, timeout=30)
 
-    # Not found → definitely doesn't exist
     if resp.status_code == 404:
         return False
 
-    # Auth / permission weirdness → don't crash the mirror job
     if resp.status_code in (401, 403):
         msg = (resp.text or "")[:200]
         print(
@@ -99,7 +97,6 @@ def bunny_object_exists(path):
         )
         return False
 
-    # Anything else unexpected → bubble up
     resp.raise_for_status()
     return True
 
@@ -348,27 +345,51 @@ def bunny_db_mirror_path_for_db_url(db_url):
 def prune_old_commits(owner, repo, keep=3):
     """
     Look under /owner/repo/ and delete commit directories older than `keep`.
-    We treat each entry at that level as a ref/commit name.
-    """
-    base_path = f"{owner}/{repo}"
-    entries = list_bunny_directory(base_path)
-    # entries is a list of dictionaries; "ObjectName" includes the full path
-    refs = []
-    for e in entries:
-        name = e.get("ObjectName", "")
-        # For folders, Bunny returns "owner/repo/ref/"
-        parts = [x for x in name.split("/") if x]
-        if len(parts) == 3:
-            refs.append(parts[2])
+    We treat each directory at that level as a ref/commit name.
 
-    # Very naive "oldest first": sort alphabetically
-    refs = sorted(refs)
-    if len(refs) <= keep:
+    Uses Bunny's LastChanged field so we keep the most recently touched refs.
+    """
+    base_path = PurePosixPath(owner) / repo
+    entries = list_bunny_directory(base_path)
+    if not entries:
+        print(f"[PRUNE] No entries under {base_path}, nothing to prune.")
         return
 
-    to_delete = refs[0 : len(refs) - keep]
-    for ref in to_delete:
-        delete_bunny_path(f"{owner}/{repo}/{ref}/")
+    # Collect (full_path, ref, last_changed) for directory entries
+    dirs = []
+    for e in entries:
+        if not e.get("IsDirectory"):
+            continue
+
+        name = e.get("ObjectName", "")
+        # Expect something like "MiSTer-devel/Distribution_MiSTer/<ref>/"
+        parts = [x for x in name.split("/") if x]
+        if len(parts) != 3:
+            continue
+
+        ref = parts[2]
+        last_changed = e.get("LastChanged") or ""
+        dirs.append((name, ref, last_changed))
+
+    if len(dirs) <= keep:
+        print(f"[PRUNE] {len(dirs)} refs under {base_path}, <= keep={keep}; nothing to prune.")
+        return
+
+    # Sort newest first by LastChanged (ISO 8601 sorts lexicographically OK)
+    dirs_sorted = sorted(dirs, key=lambda x: x[2], reverse=True)
+
+    # Keep the newest `keep`, prune the rest
+    to_keep = dirs_sorted[:keep]
+    to_delete = dirs_sorted[keep:]
+
+    print(
+        f"[PRUNE] {len(dirs)} refs under {base_path}; "
+        f"keeping {len(to_keep)}, deleting {len(to_delete)} (keep={keep})"
+    )
+
+    for full_name, ref, last_changed in to_delete:
+        print(f"[PRUNE] Deleting old ref {ref} (LastChanged={last_changed}) at {full_name}")
+        delete_bunny_path(full_name)
 
 def main():
     print(f"Using Bunny host: {BUNNY_STORAGE_HOST}")
