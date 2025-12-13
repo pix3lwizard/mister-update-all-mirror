@@ -336,11 +336,20 @@ def rewrite_db_urls(db_json, commits_for_db):
         if "contents_file" in zip_entry:
             zip_entry["contents_file"] = rewrite_url(zip_entry["contents_file"])
 
-    # files[*].url
-    for f in new_db.get("files", []):
-        # Only rewrite if this entry is a dict with a "url" key
-        if isinstance(f, dict) and "url" in f:
-            f["url"] = rewrite_url(f["url"])
+    # files: handle both list-of-dicts and dict-of-filenames variants
+    files_val = new_db.get("files")
+
+    # Case 1: some DBs use a list of objects like {"url": "...", ...}
+    if isinstance(files_val, list):
+        for f in files_val:
+            if isinstance(f, dict) and "url" in f:
+                f["url"] = rewrite_url(f["url"])
+
+    # Case 2: Distribution_MiSTer style:
+    #   "files": { "path/filename": { "hash": ..., "size": ..., "tags": [...] }, ... }
+    # No direct URLs here; they’re resolved via base_files_url, which we already rewrite.
+    elif isinstance(files_val, dict):
+        pass  # nothing to rewrite for this shape
 
     return new_db
 
