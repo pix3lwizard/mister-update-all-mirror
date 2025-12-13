@@ -12,7 +12,7 @@ This repository does **not** replace Update All. Instead, it provides a fast, CD
 
 At a high level:
 
-1. **Reads the "source of truth" database list** from José’s `databases.py` in the Update_All_MiSTer repo.
+1. **Reads the "source of truth" database list** from Theypsilon’s `databases.py` in the Update_All_MiSTer repo.
 2. **Identifies the exact GitHub commits** referenced by each database (via `base_files_url`, `linux`, `zips`, etc).
 3. **Downloads those commit snapshots** from GitHub as zipballs.
 4. **Uploads their contents to Bunny Storage** under a path that includes the commit SHA:
