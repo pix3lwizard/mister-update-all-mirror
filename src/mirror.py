@@ -2,12 +2,14 @@
 import io
 import json
 import os
+import re
 import zipfile
 import types
 import importlib.util
 from urllib.parse import urlparse
 from pathlib import PurePosixPath
 from datetime import datetime
+import time
 
 import requests
 
@@ -34,10 +36,13 @@ def http_get(url, **kwargs):
     return resp
 
 
-def http_put_to_bunny(dest_path, data, content_type=None):
+def http_put_to_bunny(dest_path, data, content_type=None, max_retries=3):
     """
-    Upload a single object to Bunny Storage under:
-      https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}
+    Upload a single object to Bunny Storage.
+
+    - Retries a few times on transient network issues (timeouts, connection resets).
+    - Skips 400 Bad Request objects (Bunny hates some filenames) but keeps going.
+    - Raises on "hard" HTTP errors (5xx, 403, etc.).
     """
     dest = str(dest_path).lstrip("/")
     url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}"
@@ -47,20 +52,51 @@ def http_put_to_bunny(dest_path, data, content_type=None):
     if content_type:
         headers["Content-Type"] = content_type
 
-    resp = requests.put(url, data=data, headers=headers, timeout=60)
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Slightly more generous timeout than before
+            resp = requests.put(url, data=data, headers=headers, timeout=120)
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError) as e:
+            print(
+                f"[WARN] PUT attempt {attempt}/{max_retries} to Bunny timed out "
+                f"or failed for {url}: {e}"
+            )
+            if attempt == max_retries:
+                print(
+                    "[WARN] Giving up on this object for now; "
+                    "it can be retried on a later run."
+                )
+                return None
+            # brief backoff before retrying
+            time.sleep(2 * attempt)
+            continue
+        except requests.exceptions.RequestException as e:
+            # Some other non-HTTP request problem; log and skip this one file
+            print(f"[ERROR] RequestException talking to Bunny for {url}: {e!r}")
+            return None
 
-    # Some filenames may be rejected (400) – log & skip those objects only.
-    if resp.status_code == 400:
-        msg = (resp.text or "")[:200]
-        print(f"[WARN] Bunny 400 Bad Request for {url}: {msg!r} – skipping this object")
-        return
+        # Got a response, now handle status codes
+        if resp.status_code == 400:
+            msg = (resp.text or "")[:200]
+            print(
+                f"[WARN] Bunny 400 Bad Request for {url}: {msg!r} – "
+                "skipping this object"
+            )
+            return None
 
-    if not resp.ok:
-        msg = (resp.text or "")[:200]
-        print(f"[ERROR] Bunny responded with {resp.status_code} for {url}: {msg!r}")
-        resp.raise_for_status()
+        if not resp.ok:
+            msg = (resp.text or "")[:200]
+            print(
+                f"[ERROR] Bunny responded with {resp.status_code} for {url}: "
+                f"{msg!r}"
+            )
+            # For 401/403/5xx, still raise so we notice real config problems
+            resp.raise_for_status()
 
-    return resp
+        # Success
+        return resp
 
 
 def list_bunny_directory(path):
