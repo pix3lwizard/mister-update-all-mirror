@@ -44,5 +44,10 @@ jobs:
           BUNNY_STORAGE_HOST: ${{ secrets.BUNNY_STORAGE_HOST }}
           MIRROR_BASE_URL: ${{ secrets.MIRROR_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # NEW:
+          MIRROR_GITHUB_RELEASE_ASSETS: "1"
+          MIRROR_ARCHIVE_ORG: "1"
+		  
         run: |
           python src/mirror.py
