@@ -48,6 +48,6 @@ jobs:
           # NEW:
           MIRROR_GITHUB_RELEASE_ASSETS: "1"
           MIRROR_ARCHIVE_ORG: "1"
-		  
+
         run: |
           python src/mirror.py
