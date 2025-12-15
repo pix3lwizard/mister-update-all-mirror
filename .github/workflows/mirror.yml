@@ -4,9 +4,9 @@ on:
   # Manual run button
   workflow_dispatch:
 
-  # Run automatically every 3 hours (José suggested 2–4h)
+  # Run automatically every 4 hours (José suggested 2–4h)
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "0 */4 * * *"
 
   # Also run when you change the mirror code or workflow
   push:
@@ -45,7 +45,7 @@ jobs:
           MIRROR_BASE_URL: ${{ secrets.MIRROR_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # NEW:
+          # 1 = yes, 0 = no (José initially advised no, but I figured...'why not?')
           MIRROR_GITHUB_RELEASE_ASSETS: "1"
           MIRROR_ARCHIVE_ORG: "1"
 
