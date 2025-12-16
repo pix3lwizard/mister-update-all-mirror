@@ -49,5 +49,8 @@ jobs:
           MIRROR_GITHUB_RELEASE_ASSETS: "1"
           MIRROR_ARCHIVE_ORG: "1"
 
+          # Skip enviroment for forks José suggested skipping for now, 1 = yes, 0 = no
+          SKIP_DISTRIBUTION_MISTER_FORKS: "1"
+
         run: |
           python src/mirror.py
