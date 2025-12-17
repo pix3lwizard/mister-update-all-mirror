@@ -144,30 +144,40 @@ def _bunny_url(dest_path: str | PurePosixPath) -> str:
 def bunny_object_exists(path: str | PurePosixPath) -> bool:
     url = _bunny_url(path)
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
-    if VERBOSE_HTTP:
-        _log(f"[HEAD] {url}")
-    resp = session().head(url, headers=headers, timeout=30)
-    if resp.status_code == 404:
-        return False
-    if resp.status_code in (401, 403):
-        # Some Bunny zones occasionally deny HEAD even when GET/PUT works.
-        # Fall back to a tiny ranged GET probe to avoid re-uploading whole commits.
-        probe_headers = dict(headers)
-        probe_headers["Range"] = "bytes=0-0"
-        if VERBOSE_HTTP:
-            _log(f"[GET] {url} (range probe)")
-        resp2 = session().get(url, headers=probe_headers, timeout=30)
-        if resp2.status_code in (200, 206):
+
+    # Try HEAD first (fast when it works)
+    try:
+        resp = session().head(url, headers=headers, timeout=30)
+        if resp.status_code == 404:
+            return False
+        if resp.status_code in (200, 204):
             return True
+        # If HEAD is denied/unsupported, fall through to Range-GET probe
+    except Exception:
+        pass
+
+    # Fallback: tiny Range GET (works like “does it exist?” without downloading the file)
+    try:
+        resp2 = session().get(
+            url,
+            headers={**headers, "Range": "bytes=0-0"},
+            stream=True,
+            timeout=30,
+        )
         if resp2.status_code == 404:
             return False
-        if resp2.status_code in (401, 403):
-            _log(f"[WARN] Bunny GET denied ({resp2.status_code}) for {url}; treating as not mirrored.")
-            return False
+        if resp2.status_code in (200, 206):
+            return True
         resp2.raise_for_status()
         return True
-    resp.raise_for_status()
-    return True
+    except Exception as e:
+        _log(f"[WARN] Bunny probe failed for {url}; assuming not mirrored. {e}")
+        return False
+    finally:
+        try:
+            resp2.close()
+        except Exception:
+            pass
 
 def list_bunny_directory(path: str | PurePosixPath) -> list[dict]:
     url = _bunny_url(PurePosixPath(path))
