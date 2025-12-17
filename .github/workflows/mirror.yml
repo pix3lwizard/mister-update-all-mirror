@@ -45,6 +45,11 @@ jobs:
           MIRROR_BASE_URL: ${{ secrets.MIRROR_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+          # Skip or mirror distribution forks and other stuff for speed - "1" = yes, "0" = no
+          SKIP_DISTRIBUTION_MISTER_FORKS: "0"
+          MIRROR_GITHUB_RELEASE_ASSETS: "1"
+          MIRROR_ARCHIVE_ORG: "1"
+
           # Performance tuning for mirror_stellar.py
           UPLOAD_WORKERS: "32"
           UPLOAD_IN_FLIGHT: "256"
