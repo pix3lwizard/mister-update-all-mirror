@@ -585,16 +585,39 @@ def mirror_external_file(url: str, dest_path: PurePosixPath) -> None:
     _log(f"[EXT] Downloading {url}")
     with tempfile.TemporaryDirectory(prefix="mister_ext_") as tmp:
         tmp_path = Path(tmp) / "payload.bin"
-        # follow redirects; stream to disk
-        r = session().get(url, stream=True, timeout=600)
-        r.raise_for_status()
-        with tmp_path.open("wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+
+        try:
+            # follow redirects; stream to disk
+            r = session().get(url, stream=True, timeout=600)
+            status = r.status_code
+
+            # Common external failures: don’t kill the run
+            if status in (401, 403, 404, 410):
+                _log(f"[WARN] External payload unavailable ({status}) for {url}; skipping.")
+                return
+            if 400 <= status < 500:
+                _log(f"[WARN] External payload client error ({status}) for {url}; skipping.")
+                return
+
+            r.raise_for_status()
+
+            with tmp_path.open("wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        except requests.exceptions.RequestException as e:
+            _log(f"[WARN] External payload download failed for {url}; skipping. {e}")
+            return
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
 
         if not put_file_to_bunny(dest_path, tmp_path):
-            raise RuntimeError(f"Failed to upload external payload to {dest_path}")
+            _log(f"[WARN] Failed to upload external payload to {dest_path}; skipping.")
+            return
 
 def mirror_external_payloads(db_json: dict) -> None:
     """
