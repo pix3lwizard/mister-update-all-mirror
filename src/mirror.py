@@ -1,43 +1,81 @@
 # src/mirror.py
+"""
+Stellar mirror for Update_All_MiSTer -> Bunny Storage.
+
+Key improvements vs naive per-file PUT loop:
+- Extract zipball to disk and upload with a thread pool (fast for many tiny files)
+- Reuse HTTP connections via per-thread requests.Session (keep-alive + pooling)
+- Throttled logging (avoids Actions log bottlenecks)
+- Marker file prevents re-mirroring the same commit
+- Safer marker behavior: only written when uploads succeed (skips 400s)
+- Keeps DB URL paths intact (fixes /db/, /releases/ path drops)
+
+This script mirrors *GitHub repo commits* referenced by theypsilon's databases.py
+and publishes mirrored DB entrypoints that point to MIRROR_BASE_URL.
+
+Env vars (core):
+  BUNNY_STORAGE_ZONE (required)
+  BUNNY_ACCESS_KEY   (required)
+  BUNNY_STORAGE_HOST (optional, e.g. la.storage.bunnycdn.com)
+  MIRROR_BASE_URL    (required, e.g. https://uam-mirror.mysticalrealm.org)
+  GITHUB_TOKEN       (optional but strongly recommended)
+
+Env vars (performance):
+  UPLOAD_WORKERS      (default 32)
+  UPLOAD_IN_FLIGHT    (default workers*8)
+  UPLOAD_LOG_EVERY    (default 500)
+  VERBOSE_HTTP        (default 0)
+
+Env vars (selection):
+  SKIP_DISTRIBUTION_MISTER_FORKS (default 1)
+  SKIP_ALLDBS_ATTRS  (default "", comma-separated)
+  KEEP_COMMITS       (default 3)
+
+Env vars (optional; implemented but default OFF):
+  MIRROR_GITHUB_RELEASE_ASSETS (default 0)
+  MIRROR_ARCHIVE_ORG          (default 0)  # recommended OFF unless you have rights
+"""
+from __future__ import annotations
+
 import io
 import json
 import os
 import re
+import time
 import zipfile
 import types
+import threading
+import tempfile
 import importlib.util
-from urllib.parse import urlparse
-from pathlib import PurePosixPath
 from datetime import datetime
-import time
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Upstream "source of truth" for DB definitions
-UPSTREAM_DATABASES_URL = (
-    "https://raw.githubusercontent.com/theypsilon/Update_All_MiSTer/"
-    "master/src/update_all/databases.py"
-)
 
-# GitHub zipball template for mirroring specific commits
-GITHUB_ZIPBALL_TEMPLATE = "https://api.github.com/repos/{owner}/{repo}/zipball/{ref}"
-
-# Bunny + mirror configuration (provided via GitHub Actions env)
+# ----------------------------
+# Config
+# ----------------------------
 BUNNY_STORAGE_ZONE = os.environ["BUNNY_STORAGE_ZONE"]
 BUNNY_ACCESS_KEY = os.environ["BUNNY_ACCESS_KEY"]
 BUNNY_STORAGE_HOST = os.environ.get("BUNNY_STORAGE_HOST", "storage.bunnycdn.com")
 MIRROR_BASE_URL = os.environ["MIRROR_BASE_URL"].rstrip("/")
-# Optional skipping for big/slow DBs (useful for early testing)
-# 1 = skip forks, 0 = include forks
-SKIP_DISTRIBUTION_MISTER_FORKS = os.environ.get("SKIP_DISTRIBUTION_MISTER_FORKS", "1") == "1"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 
-# Comma-separated list of AllDBs attribute names to skip entirely
-# Example: "ARCADE_ROMS,BIOS"
-SKIP_ALLDBS_ATTRS = {
-    x.strip()
-    for x in os.environ.get("SKIP_ALLDBS_ATTRS", "").split(",")
-    if x.strip()
-}
+UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "32"))
+UPLOAD_IN_FLIGHT = int(os.environ.get("UPLOAD_IN_FLIGHT", str(max(UPLOAD_WORKERS * 8, 128))))
+UPLOAD_LOG_EVERY = int(os.environ.get("UPLOAD_LOG_EVERY", "500"))
+VERBOSE_HTTP = os.environ.get("VERBOSE_HTTP", "0") == "1"
+
+KEEP_COMMITS = int(os.environ.get("KEEP_COMMITS", "3"))
+
+# Optional skipping for big/slow DBs (useful for early testing)
+SKIP_DISTRIBUTION_MISTER_FORKS = os.environ.get("SKIP_DISTRIBUTION_MISTER_FORKS", "1") == "1"
+SKIP_ALLDBS_ATTRS = {x.strip() for x in os.environ.get("SKIP_ALLDBS_ATTRS", "").split(",") if x.strip()}
 
 # These two Distribution MiSTer forks are the heavy hitters José suggested skipping for now:
 _DISTRIBUTION_FORK_ATTRS = {
@@ -45,538 +83,619 @@ _DISTRIBUTION_FORK_ATTRS = {
     "MISTER_AITORGOMEZ_DISTRIBUTION_MISTER",
 }
 
+MIRROR_GITHUB_RELEASE_ASSETS = os.environ.get("MIRROR_GITHUB_RELEASE_ASSETS", "0") == "1"
+MIRROR_ARCHIVE_ORG = os.environ.get("MIRROR_ARCHIVE_ORG", "0") == "1"
+
+UPSTREAM_DATABASES_URL = (
+    "https://raw.githubusercontent.com/theypsilon/Update_All_MiSTer/"
+    "master/src/update_all/databases.py"
+)
+
+GITHUB_ZIPBALL_TEMPLATE = "https://api.github.com/repos/{owner}/{repo}/zipball/{ref}"
 
 
-def http_get(url, **kwargs):
-    print(f"[GET] {url}")
-    resp = requests.get(url, timeout=60, **kwargs)
-    resp.raise_for_status()
-    return resp
+# ----------------------------
+# HTTP sessions (fast + pooled)
+# ----------------------------
+_thread_local = threading.local()
+
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=6,
+        connect=6,
+        read=6,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD", "PUT", "DELETE"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retries,
+        pool_connections=max(UPLOAD_WORKERS * 2, 64),
+        pool_maxsize=max(UPLOAD_WORKERS * 2, 64),
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+def session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = _build_session()
+        _thread_local.session = s
+    return s
 
 
-def http_put_to_bunny(dest_path, data, content_type=None, max_retries=3):
-    """
-    Upload a single object to Bunny Storage.
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
-    - Retries a few times on transient network issues (timeouts, connection resets).
-    - Skips 400 Bad Request objects (Bunny hates some filenames) but keeps going.
-    - Raises on "hard" HTTP errors (5xx, 403, etc.).
-    """
+
+# ----------------------------
+# Bunny Storage helpers
+# ----------------------------
+def _bunny_url(dest_path: str | PurePosixPath) -> str:
     dest = str(dest_path).lstrip("/")
-    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}"
-    print(f"[PUT] {url}")
+    return f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}"
 
+def bunny_object_exists(path: str | PurePosixPath) -> bool:
+    url = _bunny_url(path)
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
-    if content_type:
-        headers["Content-Type"] = content_type
+    if VERBOSE_HTTP:
+        _log(f"[HEAD] {url}")
+    resp = session().head(url, headers=headers, timeout=30)
+    if resp.status_code == 404:
+        return False
+    if resp.status_code in (401, 403):
+        _log(f"[WARN] Bunny HEAD denied ({resp.status_code}) for {url}; treating as not mirrored.")
+        return False
+    resp.raise_for_status()
+    return True
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            # Slightly more generous timeout than before
-            resp = requests.put(url, data=data, headers=headers, timeout=120)
-        except (requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError) as e:
-            print(
-                f"[WARN] PUT attempt {attempt}/{max_retries} to Bunny timed out "
-                f"or failed for {url}: {e}"
-            )
-            if attempt == max_retries:
-                print(
-                    "[WARN] Giving up on this object for now; "
-                    "it can be retried on a later run."
-                )
-                return None
-            # brief backoff before retrying
-            time.sleep(2 * attempt)
-            continue
-        except requests.exceptions.RequestException as e:
-            # Some other non-HTTP request problem; log and skip this one file
-            print(f"[ERROR] RequestException talking to Bunny for {url}: {e!r}")
-            return None
-
-        # Got a response, now handle status codes
-        if resp.status_code == 400:
-            msg = (resp.text or "")[:200]
-            print(
-                f"[WARN] Bunny 400 Bad Request for {url}: {msg!r} – "
-                "skipping this object"
-            )
-            return None
-
-        if not resp.ok:
-            msg = (resp.text or "")[:200]
-            print(
-                f"[ERROR] Bunny responded with {resp.status_code} for {url}: "
-                f"{msg!r}"
-            )
-            # For 401/403/5xx, still raise so we notice real config problems
-            resp.raise_for_status()
-
-        # Success
-        return resp
-
-
-def list_bunny_directory(path):
-    """
-    List files in a Bunny Storage directory.
-    Returns a list of objects (dicts with ObjectName, IsDirectory, LastChanged, etc.),
-    or [] if the directory doesn't exist.
-    """
-    dir_path = str(PurePosixPath(path)).lstrip("/")
-    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dir_path}"
-    print(f"[LIST] {url}")
+def list_bunny_directory(path: str | PurePosixPath) -> list[dict]:
+    url = _bunny_url(PurePosixPath(path))
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
-    resp = requests.get(url, headers=headers, timeout=60)
-
+    if VERBOSE_HTTP:
+        _log(f"[LIST] {url}")
+    resp = session().get(url, headers=headers, timeout=60)
     if resp.status_code == 404:
         return []
-
     resp.raise_for_status()
     try:
         return resp.json()
     except Exception:
         return []
 
-
-def bunny_object_exists(path):
-    """
-    Return True if a given object exists in Bunny Storage, False if 404.
-
-    If Bunny rejects the HEAD (401/403/etc), we log a warning and
-    assume the object does NOT exist so the mirror can proceed.
-    """
-    obj = str(path).lstrip("/")
-    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{obj}"
+def delete_bunny_path(path: str | PurePosixPath) -> None:
+    url = _bunny_url(path)
     headers = {"AccessKey": BUNNY_ACCESS_KEY}
-
-    print(f"[HEAD] {url}")
-    resp = requests.head(url, headers=headers, timeout=30)
-
-    if resp.status_code == 404:
-        return False
-
-    if resp.status_code in (401, 403):
-        msg = (resp.text or "")[:200]
-        print(
-            f"[WARN] Bunny HEAD {url} returned {resp.status_code}; "
-            f"treating as 'not mirrored yet'. Response: {msg!r}"
-        )
-        return False
-
-    resp.raise_for_status()
-    return True
-
-
-def delete_bunny_path(path):
-    """
-    Delete a file or "directory" path in Bunny Storage.
-    """
-    obj = str(path).lstrip("/")
-    url = f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{obj}"
-    print(f"[DELETE] {url}")
-    headers = {"AccessKey": BUNNY_ACCESS_KEY}
-    resp = requests.delete(url, headers=headers, timeout=60)
+    if VERBOSE_HTTP:
+        _log(f"[DELETE] {url}")
+    resp = session().delete(url, headers=headers, timeout=60)
     if resp.status_code not in (200, 204, 404):
         resp.raise_for_status()
 
+def put_bytes_to_bunny(dest_path: str | PurePosixPath, data: bytes, content_type: str | None = None) -> bool:
+    url = _bunny_url(dest_path)
+    headers = {"AccessKey": BUNNY_ACCESS_KEY}
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    if VERBOSE_HTTP:
+        _log(f"[PUT] {url}")
+    resp = session().put(url, data=data, headers=headers, timeout=180)
+    if resp.status_code == 400:
+        _log(f"[WARN] Bunny 400 for {url} (bad name?) skipping object.")
+        return True
+    if not resp.ok:
+        msg = (resp.text or "")[:200]
+        _log(f"[ERROR] Bunny PUT {resp.status_code} for {url}: {msg!r}")
+        return False
+    return True
+
+def put_file_to_bunny(dest_path: str | PurePosixPath, file_path: Path, content_type: str | None = None) -> bool:
+    url = _bunny_url(dest_path)
+    headers = {"AccessKey": BUNNY_ACCESS_KEY}
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    if VERBOSE_HTTP:
+        _log(f"[PUT] {url}")
+    try:
+        with file_path.open("rb") as f:
+            resp = session().put(url, data=f, headers=headers, timeout=180)
+    except requests.exceptions.RequestException as e:
+        _log(f"[ERROR] PUT exception for {url}: {e!r}")
+        return False
+
+    if resp.status_code == 400:
+        _log(f"[WARN] Bunny 400 for {url} (bad name?) skipping object.")
+        return True
+    if not resp.ok:
+        msg = (resp.text or "")[:200]
+        _log(f"[ERROR] Bunny PUT {resp.status_code} for {url}: {msg!r}")
+        return False
+    return True
+
+
+# ----------------------------
+# Upstream loading & DB parsing
+# ----------------------------
+def http_get(url: str, headers: dict | None = None, stream: bool = False, timeout: int = 120) -> requests.Response:
+    if VERBOSE_HTTP:
+        _log(f"[GET] {url}")
+    resp = session().get(url, headers=headers, stream=stream, timeout=timeout)
+    resp.raise_for_status()
+    return resp
 
 def load_upstream_databases_module():
-    """
-    Fetch theypsilon's databases.py and exec it into a module object.
-    We trust this code (same trust as running update_all itself).
-    """
-    resp = http_get(UPSTREAM_DATABASES_URL)
+    resp = http_get(UPSTREAM_DATABASES_URL, timeout=120)
     source = resp.text
-
     spec = importlib.util.spec_from_loader("upstream_databases", loader=None)
     mod = types.ModuleType(spec.name)
     exec(source, mod.__dict__)
     return mod
 
-
 def iter_all_db_entries(upstream_mod):
-    """
-    Iterate over (name, db) from AllDBs.* where db has a db_url.
-    """
     all_dbs_cls = upstream_mod.AllDBs
     for attr in dir(all_dbs_cls):
         if attr.startswith("_"):
             continue
-
-        # Skip specific DB entries (handy for early testing / shaving runtime)
         if attr in SKIP_ALLDBS_ATTRS:
-            print(f"[SKIP] AllDBs.{attr} disabled via SKIP_ALLDBS_ATTRS")
+            _log(f"[SKIP] AllDBs.{attr} disabled via SKIP_ALLDBS_ATTRS")
             continue
         if SKIP_DISTRIBUTION_MISTER_FORKS and attr in _DISTRIBUTION_FORK_ATTRS:
-            print(f"[SKIP] AllDBs.{attr} (distribution_mister fork) disabled")
+            _log(f"[SKIP] AllDBs.{attr} (distribution_mister fork) disabled")
             continue
-
         db = getattr(all_dbs_cls, attr)
         if hasattr(db, "db_url"):
             yield attr, db
 
-
-def download_db_json(db_url):
-    """
-    Download a DB from db_url.
-    Returns (db_json_dict, original_bytes, is_zipped).
-    """
-    resp = http_get(db_url)
-    content = resp.content
-
-    if db_url.endswith(".zip") or db_url.endswith(".json.zip"):
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            # assume single json file inside
-            inner_name = [n for n in zf.namelist() if n.endswith(".json")][0]
-            data = zf.read(inner_name)
-            return json.loads(data.decode("utf-8")), content, True
+def download_db_json(db_url: str):
+    resp = http_get(db_url, timeout=180)
+    original_bytes = resp.content
+    is_zipped = db_url.endswith(".zip")
+    if is_zipped:
+        with zipfile.ZipFile(io.BytesIO(original_bytes)) as zf:
+            # theypsilon convention: db.json inside zip
+            with zf.open("db.json") as f:
+                db_json = json.loads(f.read().decode("utf-8"))
     else:
-        return json.loads(resp.text), content, False
+        db_json = json.loads(original_bytes.decode("utf-8"))
+    return db_json, original_bytes, is_zipped
 
+_RAW_GH_RE = re.compile(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$")
 
-def parse_raw_github_base(url):
-    """
-    Given something like:
-      https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/8323352e.../some/path/
-    return (owner, repo, ref).
-
-    Returns None if the value is not a string or not a raw.githubusercontent.com URL.
-    """
+def parse_raw_github_base(url: str | None):
     if not url or not isinstance(url, str):
         return None
-
-    p = urlparse(url)
-    if "raw.githubusercontent.com" not in p.netloc:
+    m = _RAW_GH_RE.match(url)
+    if not m:
         return None
-
-    parts = [x for x in p.path.split("/") if x]
-    if len(parts) < 3:
-        return None
-
-    owner, repo, ref = parts[0], parts[1], parts[2]
+    owner, repo, ref, rest = m.group(1), m.group(2), m.group(3), m.group(4)
     return owner, repo, ref
 
+def _scan_for_urls(obj):
+    """Yield URL strings found anywhere inside nested dict/list structures."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str) and (v.startswith("http://") or v.startswith("https://")):
+                yield v
+            else:
+                yield from _scan_for_urls(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from _scan_for_urls(it)
 
-def collect_commits_from_db(db_json):
-    """
-    Collect all (owner, repo, ref) tuples referenced by a DB JSON.
-    """
-    commits = set()
+def collect_commits_from_db(db_json: dict) -> set[tuple[str, str, str]]:
+    commits: set[tuple[str, str, str]] = set()
 
-    # 1. base_files_url
-    base_files_url = db_json.get("base_files_url", "")
-    parsed = parse_raw_github_base(base_files_url)
+    # base_files_url
+    parsed = parse_raw_github_base(db_json.get("base_files_url", ""))
     if parsed:
         commits.add(parsed)
 
-    # 2. linux (Distribution MiSTer)
-    linux_url = db_json.get("linux")
-    parsed = parse_raw_github_base(linux_url) if linux_url else None
+    # linux (Distribution MiSTer)
+    parsed = parse_raw_github_base(db_json.get("linux")) if db_json.get("linux") else None
     if parsed:
         commits.add(parsed)
 
-    # 3. zips[*].summary_file / contents_file
-    for zip_entry in db_json.get("zips", []):
+    # zips optimization (Distribution MiSTer)
+    for zip_entry in db_json.get("zips", []) or []:
         if not isinstance(zip_entry, dict):
             continue
         for key in ("summary_file", "contents_file"):
-            url = zip_entry.get(key)
-            parsed = parse_raw_github_base(url) if url else None
+            parsed = parse_raw_github_base(zip_entry.get(key)) if zip_entry.get(key) else None
             if parsed:
                 commits.add(parsed)
 
-    # 4. If no base_files_url, infer from first file url
-    files = [f for f in db_json.get("files", []) if isinstance(f, dict)]
-    if not commits and files:
-        first = files[0]
-        url = first.get("url") or first.get("file") or ""
-        parsed = parse_raw_github_base(url)
-        if parsed:
-            commits.add(parsed)
+    # files list (common)
+    files_list = db_json.get("files")
+    if isinstance(files_list, list):
+        for f in files_list:
+            if isinstance(f, dict):
+                url = f.get("url") or f.get("file")
+                parsed = parse_raw_github_base(url) if url else None
+                if parsed:
+                    commits.add(parsed)
+    # files dict-of-dicts (update_all_mister style)
+    elif isinstance(files_list, dict):
+        for v in files_list.values():
+            if isinstance(v, dict):
+                url = v.get("url") or v.get("file")
+                parsed = parse_raw_github_base(url) if url else None
+                if parsed:
+                    commits.add(parsed)
+
+    # last resort: scan everything for raw.githubusercontent URLs
+    if not commits:
+        for u in _scan_for_urls(db_json):
+            parsed = parse_raw_github_base(u)
+            if parsed:
+                commits.add(parsed)
 
     return commits
 
 
-def mirror_repo_commit(owner, repo, ref):
-    """
-    Download the zipball of (owner, repo, ref), unpack, upload to Bunny under:
-      /owner/repo/ref/<files...>
-
-    Uses a .mirrored.json marker under that ref directory to avoid re-uploading
-    the same commit on subsequent runs.
-    """
+# ----------------------------
+# Mirroring repo commits (fast)
+# ----------------------------
+def mirror_repo_commit(owner: str, repo: str, ref: str) -> None:
     base_dir = PurePosixPath(owner) / repo / ref
     marker_path = base_dir / ".mirrored.json"
 
-    # If we've already mirrored this commit once, skip it
     if bunny_object_exists(marker_path):
-        print(f"[SKIP] {owner}/{repo}@{ref} already mirrored (marker present)")
+        _log(f"[SKIP] {owner}/{repo}@{ref} already mirrored (marker present)")
         return
 
     zip_url = GITHUB_ZIPBALL_TEMPLATE.format(owner=owner, repo=repo, ref=ref)
-    headers = {}
-    gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if gh_token:
-        headers["Authorization"] = f"token {gh_token}"
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
-    resp = http_get(zip_url, headers=headers)
-    zdata = io.BytesIO(resp.content)
+    _log(f"[ZIP] Downloading {owner}/{repo}@{ref} zipball ...")
+    t0 = time.time()
 
-    with zipfile.ZipFile(zdata) as zf:
-        # zipball has a single top-level directory like owner-repo-<hash>/
-        for name in zf.namelist():
-            if name.endswith("/"):
-                continue
-            data = zf.read(name)
-            parts = name.split("/", 1)
-            if len(parts) == 1:
-                rel_path = parts[0]
-            else:
-                rel_path = parts[1]
-            dest_path = base_dir / rel_path
-            http_put_to_bunny(dest_path, data)
+    with tempfile.TemporaryDirectory(prefix="mister_mirror_") as tmp:
+        tmp_path = Path(tmp)
+        zip_path = tmp_path / "repo.zip"
+        extract_path = tmp_path / "extract"
+        extract_path.mkdir(parents=True, exist_ok=True)
 
-    # If we reached here, uploads completed for this commit.
-    marker = {
-        "owner": owner,
-        "repo": repo,
-        "ref": ref,
-        "mirrored_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    }
-    http_put_to_bunny(
-        marker_path,
-        json.dumps(marker, indent=2).encode("utf-8"),
-        content_type="application/json",
-    )
-    print(f"[MARK] wrote {marker_path} for {owner}/{repo}@{ref}")
+        # Stream download to disk
+        resp = http_get(zip_url, headers=headers, stream=True, timeout=300)
+        with zip_path.open("wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+        # Extract
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(extract_path)
+
+        # zipball has one top folder
+        roots = [p for p in extract_path.iterdir() if p.is_dir()]
+        if not roots:
+            raise RuntimeError(f"Zipball for {owner}/{repo}@{ref} had no root folder?")
+        root = roots[0]
+
+        # Upload files in parallel
+        total = 0
+        ok = 0
+        failed = 0
+        futures = []
+
+        def submit_upload(src_file: Path):
+            rel = src_file.relative_to(root).as_posix()
+            dest_path = base_dir / rel
+            return executor.submit(put_file_to_bunny, dest_path, src_file)
+
+        _log(f"[UPLOAD] Uploading files for {owner}/{repo}@{ref} with {UPLOAD_WORKERS} workers ...")
+        with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    src = Path(dirpath) / fn
+                    total += 1
+                    futures.append(submit_upload(src))
+
+                    # keep in-flight bounded
+                    if len(futures) >= UPLOAD_IN_FLIGHT:
+                        for fut in as_completed(futures):
+                            if fut.result():
+                                ok += 1
+                            else:
+                                failed += 1
+                            if (ok + failed) % UPLOAD_LOG_EVERY == 0:
+                                _log(f"[PROGRESS] {owner}/{repo}@{ref}: {ok}/{total} ok, {failed} failed")
+                            # stop early drain after some completions
+                            if len(futures) <= UPLOAD_WORKERS:
+                                break
+                        # remove done futures
+                        futures = [f for f in futures if not f.done()]
+
+            # Final drain
+            for fut in as_completed(futures):
+                if fut.result():
+                    ok += 1
+                else:
+                    failed += 1
+                if (ok + failed) % UPLOAD_LOG_EVERY == 0:
+                    _log(f"[PROGRESS] {owner}/{repo}@{ref}: {ok}/{total} ok, {failed} failed")
+
+        elapsed = time.time() - t0
+        _log(f"[DONE] {owner}/{repo}@{ref}: total={total}, ok={ok}, failed={failed}, elapsed={elapsed:.1f}s")
+
+        if failed > 0:
+            _log(f"[WARN] {owner}/{repo}@{ref} had {failed} upload failures; NOT writing marker so next run retries.")
+            return
+
+        marker = {
+            "owner": owner,
+            "repo": repo,
+            "ref": ref,
+            "mirrored_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "total_files": total,
+            "upload_seconds": round(elapsed, 3),
+        }
+        if not put_bytes_to_bunny(
+            marker_path,
+            json.dumps(marker, indent=2).encode("utf-8"),
+            content_type="application/json",
+        ):
+            _log(f"[WARN] Failed to write marker for {owner}/{repo}@{ref}")
+        else:
+            _log(f"[MARK] wrote {marker_path} for {owner}/{repo}@{ref}")
 
 
-def rewrite_db_urls(db_json, commits_for_db):
+# ----------------------------
+# DB URL rewriting + placement
+# ----------------------------
+def _raw_prefix(owner: str, repo: str, ref: str) -> str:
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/"
+
+def _mirror_prefix(owner: str, repo: str, ref: str) -> str:
+    return f"{MIRROR_BASE_URL}/{owner}/{repo}/{ref}/"
+
+def rewrite_db_urls(db_json: dict, commits: set[tuple[str, str, str]]) -> dict:
+    # Build replacement table: raw -> mirror
+    repl = {}
+    for (o, r, ref) in commits:
+        repl[_raw_prefix(o, r, ref)] = _mirror_prefix(o, r, ref)
+
+    def rewrite_str(s: str) -> str:
+        if not isinstance(s, str):
+            return s
+        for src, dst in repl.items():
+            if s.startswith(src):
+                return dst + s[len(src):]
+
+        # Optional external payload rewriting (only if you also enabled mirroring them)
+        if MIRROR_GITHUB_RELEASE_ASSETS:
+            dest = _dest_for_github_release(s)
+            if dest:
+                return f"{MIRROR_BASE_URL}/{dest.as_posix()}"
+
+        if MIRROR_ARCHIVE_ORG:
+            dest = _dest_for_archive_org(s)
+            if dest:
+                return f"{MIRROR_BASE_URL}/{dest.as_posix()}"
+
+        return s
+        for src, dst in repl.items():
+            if s.startswith(src):
+                return dst + s[len(src):]
+        # optional rewriting for github releases (keep hosted on github by default)
+        if MIRROR_GITHUB_RELEASE_ASSETS and "https://github.com/" in s and "/releases/download/" in s:
+            # Map to mirror under /owner/repo/releases/download/...
+            p = urlparse(s)
+            parts = [x for x in p.path.split("/") if x]
+            if len(parts) >= 5 and parts[2] == "releases" and parts[3] == "download":
+                owner, repo = parts[0], parts[1]
+                return f"{MIRROR_BASE_URL}/{owner}/{repo}/" + "/".join(parts[2:])
+        if MIRROR_ARCHIVE_ORG and "archive.org" in s:
+            # Conservative placement
+            p = urlparse(s)
+            return f"{MIRROR_BASE_URL}/_ext/{p.netloc}" + p.path
+        return s
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if isinstance(v, str):
+                    out[k] = rewrite_str(v)
+                else:
+                    out[k] = walk(v)
+            return out
+        elif isinstance(obj, list):
+            return [walk(x) for x in obj]
+        else:
+            return obj
+
+    return walk(db_json)
+
+
+# ----------------------------
+# External payload mirroring (optional)
+# ----------------------------
+_GH_RELEASE_RE = re.compile(r"^https?://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)$")
+
+def _dest_for_github_release(url: str) -> PurePosixPath | None:
+    m = _GH_RELEASE_RE.match(url)
+    if not m:
+        return None
+    owner, repo, tag, filename = m.group(1), m.group(2), m.group(3), m.group(4)
+    # normalize filename (strip query if any)
+    filename = filename.split("?", 1)[0]
+    return PurePosixPath(owner, repo, "releases", "download", tag, filename)
+
+def _dest_for_archive_org(url: str) -> PurePosixPath | None:
+    p = urlparse(url)
+    if "archive.org" not in p.netloc:
+        return None
+    path = p.path.lstrip("/")
+    if not path:
+        return None
+    return PurePosixPath("_ext", p.netloc, *path.split("/"))
+
+def mirror_external_file(url: str, dest_path: PurePosixPath) -> None:
+    if bunny_object_exists(dest_path):
+        return
+
+    _log(f"[EXT] Downloading {url}")
+    with tempfile.TemporaryDirectory(prefix="mister_ext_") as tmp:
+        tmp_path = Path(tmp) / "payload.bin"
+        # follow redirects; stream to disk
+        r = session().get(url, stream=True, timeout=600)
+        r.raise_for_status()
+        with tmp_path.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+        if not put_file_to_bunny(dest_path, tmp_path):
+            raise RuntimeError(f"Failed to upload external payload to {dest_path}")
+
+def mirror_external_payloads(db_json: dict) -> None:
     """
-    Return a new DB JSON where:
-    - base_files_url and any raw.githubusercontent.com URLs pointing to
-      known (owner,repo,ref) are rewritten to your mirror.
+    If MIRROR_GITHUB_RELEASE_ASSETS / MIRROR_ARCHIVE_ORG are enabled, mirror any matching URLs
+    referenced by this db_json.
     """
+    if not (MIRROR_GITHUB_RELEASE_ASSETS or MIRROR_ARCHIVE_ORG):
+        return
 
-    def rewrite_url(url):
-        if not url:
-            return url
-        parsed = parse_raw_github_base(url)
-        if not parsed:
-            return url
-        owner, repo, ref = parsed
-        if (owner, repo, ref) not in commits_for_db:
-            return url
-        # Build mirror prefix; keep the relative path after /ref/
-        p = urlparse(url)
-        parts = [x for x in p.path.split("/") if x]
-        # parts[0]=owner, [1]=repo, [2]=ref
-        rel_parts = parts[3:]  # after ref
-        rel_path = "/".join(rel_parts)
-        return f"{MIRROR_BASE_URL}/{owner}/{repo}/{ref}/{rel_path}"
+    release_urls = set()
+    archive_urls = set()
+    for u in _scan_for_urls(db_json):
+        if MIRROR_GITHUB_RELEASE_ASSETS and _GH_RELEASE_RE.match(u):
+            release_urls.add(u)
+        if MIRROR_ARCHIVE_ORG and "archive.org" in u:
+            archive_urls.add(u)
 
-    new_db = json.loads(json.dumps(db_json))  # deep copy
+    # Release assets are usually few, but can be large.
+    for u in sorted(release_urls):
+        dest = _dest_for_github_release(u)
+        if dest:
+            mirror_external_file(u, dest)
 
-    # base_files_url: keep trailing slash structure
-    bf = new_db.get("base_files_url")
-    if bf:
-        parsed = parse_raw_github_base(bf)
-        if parsed:
-            owner, repo, ref = parsed
-            new_db["base_files_url"] = f"{MIRROR_BASE_URL}/{owner}/{repo}/{ref}/"
+    # Archive.org payloads can be enormous; use with care.
+    for u in sorted(archive_urls):
+        dest = _dest_for_archive_org(u)
+        if dest:
+            mirror_external_file(u, dest)
 
-    # linux
-    if "linux" in new_db:
-        new_db["linux"] = rewrite_url(new_db["linux"])
-
-    # zips
-    for zip_entry in new_db.get("zips", []):
-        if not isinstance(zip_entry, dict):
-            continue
-        if "summary_file" in zip_entry:
-            zip_entry["summary_file"] = rewrite_url(zip_entry["summary_file"])
-        if "contents_file" in zip_entry:
-            zip_entry["contents_file"] = rewrite_url(zip_entry["contents_file"])
-
-    # files: handle both list-of-dicts and dict-of-filenames variants
-    files_val = new_db.get("files")
-
-    # Case 1: some DBs use a list of objects like {"url": "...", ...}
-    if isinstance(files_val, list):
-        for f in files_val:
-            if isinstance(f, dict) and "url" in f:
-                f["url"] = rewrite_url(f["url"])
-
-    # Case 2: Distribution_MiSTer style:
-    #   "files": { "path/filename": { "hash": ..., "size": ..., "tags": [...] }, ... }
-    # No direct URLs here; they’re resolved via base_files_url, which we already rewrite.
-    elif isinstance(files_val, dict):
-        pass  # nothing to rewrite for this shape
-
-    return new_db
-
-
-def bunny_db_mirror_path_for_db_url(db_url):
+def bunny_db_mirror_path_for_db_url(db_url: str) -> str:
     """
-    Map an original db_url to a path in Bunny Storage.
-
-    GitHub raw URLs:
-      https://raw.githubusercontent.com/MiSTer-devel/Distribution_MiSTer/main/db.json.zip
-    -> MiSTer-devel/Distribution_MiSTer/main/db.json.zip
-
-    Other hosts (e.g. Aitor's):
-      https://www.aitorgomez.net/static/mistermain/db.json.zip
-    -> www.aitorgomez.net/static/mistermain/db.json.zip
+    Preserve the full path after the branch/ref. (Fixes dropping /db/ etc.)
+    raw.github: /owner/repo/branch/...
     """
     p = urlparse(db_url)
     parts = [x for x in p.path.split("/") if x]
 
-    # GitHub raw case: mirror the repo structure
     if "raw.githubusercontent.com" in p.netloc:
         if len(parts) < 4:
             raise ValueError(f"Unexpected db_url path: {db_url}")
         owner, repo, branch = parts[0], parts[1], parts[2]
-        filename = parts[-1]
-        return str(PurePosixPath(owner) / repo / branch / filename)
+        rest = parts[3:]
+        return str(PurePosixPath(owner, repo, branch, *rest))
 
     # Generic fallback: host + full path
-    host = p.netloc
-    return str(PurePosixPath(host, *parts))
+    return str(PurePosixPath(p.netloc, *parts))
 
-
-def prune_old_commits(owner, repo, keep=3):
-    """
-    Look under /owner/repo/ and delete commit directories older than `keep`.
-    We treat each directory at that level as a ref/commit name.
-
-    Uses Bunny's LastChanged field so we keep the most recently touched refs.
-    """
+def prune_old_commits(owner: str, repo: str, keep: int = KEEP_COMMITS) -> None:
     base_path = PurePosixPath(owner) / repo
     entries = list_bunny_directory(base_path)
     if not entries:
-        print(f"[PRUNE] No entries under {base_path}, nothing to prune.")
         return
 
-    # Collect (full_path, ref, last_changed) for directory entries
     dirs = []
     for e in entries:
         if not e.get("IsDirectory"):
             continue
-
-        name = e.get("ObjectName", "")
-        # Expect something like "MiSTer-devel/Distribution_MiSTer/<ref>/"
+        name = e.get("ObjectName") or ""
         parts = [x for x in name.split("/") if x]
         if len(parts) != 3:
             continue
-
         ref = parts[2]
         last_changed = e.get("LastChanged") or ""
         dirs.append((name, ref, last_changed))
 
     if len(dirs) <= keep:
-        print(f"[PRUNE] {len(dirs)} refs under {base_path}, <= keep={keep}; nothing to prune.")
         return
 
-    # Sort newest first by LastChanged (ISO 8601 sorts lexicographically ok)
     dirs_sorted = sorted(dirs, key=lambda x: x[2], reverse=True)
-
-    # Keep the newest `keep`, prune the rest
-    to_keep = dirs_sorted[:keep]
     to_delete = dirs_sorted[keep:]
-
-    print(
-        f"[PRUNE] {len(dirs)} refs under {base_path}; "
-        f"keeping {len(to_keep)}, deleting {len(to_delete)} (keep={keep})"
-    )
+    _log(f"[PRUNE] {owner}/{repo}: deleting {len(to_delete)} old refs (keep={keep})")
 
     for full_name, ref, last_changed in to_delete:
-        print(f"[PRUNE] Deleting old ref {ref} (LastChanged={last_changed}) at {full_name}")
+        _log(f"[PRUNE] Deleting {ref} (LastChanged={last_changed}) at {full_name}")
         delete_bunny_path(full_name)
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main():
-    print(f"Using Bunny host: {BUNNY_STORAGE_HOST}")
-    print(f"Using Bunny zone: {BUNNY_STORAGE_ZONE}")
+    _log(f"Using Bunny host: {BUNNY_STORAGE_HOST}")
+    _log(f"Using Bunny zone: {BUNNY_STORAGE_ZONE}")
+    _log(f"Mirror base URL: {MIRROR_BASE_URL}")
+    _log(f"Upload workers: {UPLOAD_WORKERS} (in-flight cap {UPLOAD_IN_FLIGHT})")
 
     upstream = load_upstream_databases_module()
 
-    # Discover all DB entries from upstream
-    all_entries = [name for name, _ in iter_all_db_entries(upstream)]
-    print("AllDBs entries:", all_entries)
-
-    # Build a filter that targets any DB whose name looks like Distribution_MiSTer
-    #db_filter = {n.lower() for n in all_entries if "distribution" in n.lower()}
-    #print("Using db_filter:", db_filter)
-    # For tighter testing, you could temporarily do:
-    # db_filter = {"distribution_mister"}
-
-    # No filter: process *all* DBs from AllDBs
-    db_filter = None
-    print("Using db_filter:", db_filter)
-    # For tighter testing, you could temporarily do:
-    # db_filter = {"distribution_mister"}
-
-
     for name, db in iter_all_db_entries(upstream):
-        if db_filter and name.lower() not in db_filter:
+        db_url = db.db_url
+        _log(f"\n=== Processing DB {name}: {db_url} ===")
+
+        try:
+            db_json, _, is_zipped = download_db_json(db_url)
+        except Exception as e:
+            _log(f"[ERROR] Failed to download DB for {name}: {e!r}")
             continue
 
-        db_url = db.db_url
-        print(f"\n=== Processing DB {name}: {db_url} ===")
-        try:
-            db_json, original_bytes, is_zipped = download_db_json(db_url)
-        except Exception as e:
-            print(f"Failed to download DB for {name}: {e}")
-            continue
+        mirror_external_payloads(db_json)
 
         commits = collect_commits_from_db(db_json)
-        if not commits:
-            print(f"No commits discovered for {name}, skipping mirror.")
-            continue
+        _log(f"Commits discovered for {name}: {sorted({f'{o}/{r}/{ref}' for (o,r,ref) in commits})}")
 
-        print(f"Commits to mirror for {name}: {commits}")
-
-        # Mirror all commits for this DB
-        for (owner, repo, ref) in commits:
+        # Mirror all commits
+        for (owner, repo, ref) in sorted(commits):
             mirror_repo_commit(owner, repo, ref)
-            prune_old_commits(owner, repo, keep=3)
+            prune_old_commits(owner, repo, keep=KEEP_COMMITS)
 
-        # Rewrite DB to point at the mirror
+        # Rewrite DB to point at mirror (even if commits empty, walk is safe)
         new_db_json = rewrite_db_urls(db_json, commits)
 
         # Serialize & zip if the original was zipped
         if is_zipped:
             buf = io.BytesIO()
-            with zipfile.ZipFile(
-                buf, mode="w", compression=zipfile.ZIP_DEFLATED
-            ) as zf:
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("db.json", json.dumps(new_db_json, separators=(",", ":")))
             new_bytes = buf.getvalue()
-            filename = "db.json.zip"
+            content_type = "application/octet-stream"
         else:
             new_bytes = json.dumps(new_db_json, indent=2).encode("utf-8")
-            filename = "db.json"
+            content_type = "application/json"
 
         # Upload mirrored DB to Bunny under a stable layout
         dest_path = bunny_db_mirror_path_for_db_url(db_url)
-        http_put_to_bunny(dest_path, new_bytes, content_type="application/octet-stream")
+        if not put_bytes_to_bunny(dest_path, new_bytes, content_type=content_type):
+            _log(f"[ERROR] Failed to upload mirrored DB for {name} to {dest_path}")
+            continue
 
-        # Also upload a small metadata file for debugging
+        # Small metadata file for debugging
         meta = {
             "name": name,
             "source_db_url": db_url,
-            "mirrored_commits": sorted(
-                {f"{o}/{r}/{ref}" for (o, r, ref) in commits}
-            ),
+            "mirrored_commits": sorted({f"{o}/{r}/{ref}" for (o, r, ref) in commits}),
+            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
         meta_path = str(PurePosixPath(dest_path).with_suffix(".meta.json"))
-        http_put_to_bunny(
+        put_bytes_to_bunny(
             meta_path,
             json.dumps(meta, indent=2).encode("utf-8"),
             content_type="application/json",
         )
-
 
 if __name__ == "__main__":
     main()

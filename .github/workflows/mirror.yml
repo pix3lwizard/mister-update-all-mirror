@@ -4,9 +4,9 @@ on:
   # Manual run button
   workflow_dispatch:
 
-  # Run automatically every 4 hours (José suggested 2–4h)
+  # Run automatically every 3 hours (José suggested 2–4h)
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 */3 * * *"
 
   # Also run when you change the mirror code or workflow
   push:
@@ -45,12 +45,11 @@ jobs:
           MIRROR_BASE_URL: ${{ secrets.MIRROR_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # 1 = yes, 0 = no (José initially advised no, but I figured...'why not?')
-          MIRROR_GITHUB_RELEASE_ASSETS: "1"
-          MIRROR_ARCHIVE_ORG: "1"
-
-          # Skip enviroment for forks José suggested skipping for now, 1 = yes, 0 = no
-          SKIP_DISTRIBUTION_MISTER_FORKS: "1"
+          # Performance tuning for mirror_stellar.py
+          UPLOAD_WORKERS: "32"
+          UPLOAD_IN_FLIGHT: "256"
+          UPLOAD_LOG_EVERY: "500"
+          VERBOSE_HTTP: "0"
 
         run: |
           python src/mirror.py
