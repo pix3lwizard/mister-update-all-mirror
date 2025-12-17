@@ -50,7 +50,7 @@ import tempfile
 import importlib.util
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -136,7 +136,9 @@ def _log(msg: str) -> None:
 # Bunny Storage helpers
 # ----------------------------
 def _bunny_url(dest_path: str | PurePosixPath) -> str:
-    dest = str(dest_path).lstrip("/")
+    # IMPORTANT: URL-encode object path so spaces/# and other characters are valid in HTTP requests.
+    # Keep "/" unescaped so directory structure remains intact.
+    dest = quote(str(dest_path).lstrip("/"), safe="/")
     return f"https://{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE}/{dest}"
 
 def bunny_object_exists(path: str | PurePosixPath) -> bool:
@@ -148,8 +150,22 @@ def bunny_object_exists(path: str | PurePosixPath) -> bool:
     if resp.status_code == 404:
         return False
     if resp.status_code in (401, 403):
-        _log(f"[WARN] Bunny HEAD denied ({resp.status_code}) for {url}; treating as not mirrored.")
-        return False
+        # Some Bunny zones occasionally deny HEAD even when GET/PUT works.
+        # Fall back to a tiny ranged GET probe to avoid re-uploading whole commits.
+        probe_headers = dict(headers)
+        probe_headers["Range"] = "bytes=0-0"
+        if VERBOSE_HTTP:
+            _log(f"[GET] {url} (range probe)")
+        resp2 = session().get(url, headers=probe_headers, timeout=30)
+        if resp2.status_code in (200, 206):
+            return True
+        if resp2.status_code == 404:
+            return False
+        if resp2.status_code in (401, 403):
+            _log(f"[WARN] Bunny GET denied ({resp2.status_code}) for {url}; treating as not mirrored.")
+            return False
+        resp2.raise_for_status()
+        return True
     resp.raise_for_status()
     return True
 
@@ -265,8 +281,24 @@ def download_db_json(db_url: str):
     is_zipped = db_url.endswith(".zip")
     if is_zipped:
         with zipfile.ZipFile(io.BytesIO(original_bytes)) as zf:
-            # theypsilon convention: db.json inside zip
-            with zf.open("db.json") as f:
+            # Most DB zips contain db.json, but some forks use a different inner name (e.g. dbencc.json).
+            names = [n for n in zf.namelist() if n and not n.endswith("/") and n.lower().endswith(".json")]
+            if not names:
+                raise RuntimeError(f"No .json found inside {db_url}")
+
+            # Prefer any path ending in /db.json (or db.json at root).
+            inner = next((n for n in names if n.replace("\\", "/").endswith("db.json")), None)
+
+            # Otherwise prefer the name matching the zip basename (e.g. dbencc.json.zip -> dbencc.json).
+            if inner is None:
+                zip_base = Path(urlparse(db_url).path).name
+                expected = zip_base[:-4] if zip_base.lower().endswith(".zip") else zip_base
+                inner = next((n for n in names if n.replace("\\", "/").endswith(expected)), None)
+
+            if inner is None:
+                inner = sorted(names)[0]
+
+            with zf.open(inner) as f:
                 db_json = json.loads(f.read().decode("utf-8"))
     else:
         db_json = json.loads(original_bytes.decode("utf-8"))
