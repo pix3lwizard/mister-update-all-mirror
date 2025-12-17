@@ -43,6 +43,7 @@ import os
 import re
 import time
 import zipfile
+import sys
 import types
 import threading
 import tempfile
@@ -229,11 +230,18 @@ def http_get(url: str, headers: dict | None = None, stream: bool = False, timeou
     return resp
 
 def load_upstream_databases_module():
-    resp = http_get(UPSTREAM_DATABASES_URL, timeout=120)
+    resp = http_get(UPSTREAM_DATABASES_URL)
     source = resp.text
-    spec = importlib.util.spec_from_loader("upstream_databases", loader=None)
-    mod = types.ModuleType(spec.name)
+
+    name = "upstream_databases"
+    spec = importlib.util.spec_from_loader(name, loader=None)
+    mod = types.ModuleType(name)
+    mod.__spec__ = spec
+    mod.__file__ = UPSTREAM_DATABASES_URL
+
+    sys.modules[name] = mod          # IMPORTANT: register before exec
     exec(source, mod.__dict__)
+
     return mod
 
 def iter_all_db_entries(upstream_mod):
