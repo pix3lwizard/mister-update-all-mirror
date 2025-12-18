@@ -731,10 +731,29 @@ def main():
         commits = collect_commits_from_db(db_json)
         _log(f"Commits discovered for {name}: {sorted({f'{o}/{r}/{ref}' for (o,r,ref) in commits})}")
 
-        # Mirror all commits
+        # Mirror all commits, but only publish the DB if everything mirrored cleanly
+        db_failed = False
+
         for (owner, repo, ref) in sorted(commits):
-            mirror_repo_commit(owner, repo, ref)
-            prune_old_commits(owner, repo, keep=KEEP_COMMITS)
+            try:
+                mirror_repo_commit(owner, repo, ref)
+                prune_old_commits(owner, repo, keep=KEEP_COMMITS)
+            except Exception as e:
+                _log(f"[WARN] {name}: exception while mirroring {owner}/{repo}@{ref}: {e!r}")
+                db_failed = True
+                continue
+
+            marker = PurePosixPath(owner) / repo / ref / ".mirrored.json"
+            if not bunny_object_exists(marker):
+                _log(
+                    f"[WARN] {name}: {owner}/{repo}@{ref} not fully mirrored (no marker). "
+                    "Will NOT publish DB this run."
+                )
+                db_failed = True
+
+        if db_failed:
+            _log(f"[WARN] {name}: skipping DB publish due to mirror errors; will retry next cron.")
+            continue
 
         # Rewrite DB to point at mirror (even if commits empty, walk is safe)
         new_db_json = rewrite_db_urls(db_json, commits)
