@@ -1,6 +1,6 @@
 # src/mirror.py
 """
-Mirror for Update_All_MiSTer -> Bunny Storage.
+Stellar mirror for Update_All_MiSTer -> Bunny Storage.
 
 Key improvements vs naive per-file PUT loop:
 - Extract zipball to disk and upload with a thread pool (fast for many tiny files)
@@ -50,7 +50,7 @@ import tempfile
 import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -541,6 +541,11 @@ def _mirror_prefix(owner: str, repo: str, ref: str) -> str:
     return f"{MIRROR_BASE_URL}/{owner}/{repo}/{ref}/"
 
 
+def _mirror_url_for_dest(dest: PurePosixPath) -> str:
+    """Return a properly URL-escaped mirror URL for a Bunny object path."""
+    return f"{MIRROR_BASE_URL}/{quote(dest.as_posix(), safe='/')}"
+
+
 def rewrite_db_urls(db_json: dict, commits: set[tuple[str, str, str]]) -> dict:
     # Build replacement table: raw -> mirror
     repl: dict[str, str] = {}
@@ -559,12 +564,12 @@ def rewrite_db_urls(db_json: dict, commits: set[tuple[str, str, str]]) -> dict:
         if MIRROR_GITHUB_RELEASE_ASSETS:
             dest = _dest_for_github_release(s)
             if dest:
-                return f"{MIRROR_BASE_URL}/{dest.as_posix()}"
+                return _mirror_url_for_dest(dest)
 
         if MIRROR_ARCHIVE_ORG:
             dest = _dest_for_archive_org(s)
             if dest:
-                return f"{MIRROR_BASE_URL}/{dest.as_posix()}"
+                return _mirror_url_for_dest(dest)
 
         return s
 
@@ -595,7 +600,7 @@ def _dest_for_github_release(url: str) -> PurePosixPath | None:
     if not m:
         return None
     owner, repo, tag, filename = m.group(1), m.group(2), m.group(3), m.group(4)
-    filename = filename.split("?", 1)[0]
+    filename = unquote(filename.split("?", 1)[0])
     return PurePosixPath(owner, repo, "releases", "download", tag, filename)
 
 
@@ -603,10 +608,20 @@ def _dest_for_archive_org(url: str) -> PurePosixPath | None:
     p = urlparse(url)
     if "archive.org" not in p.netloc:
         return None
-    path = p.path.lstrip("/")
-    if not path:
+
+    # Decode percent-escapes in the path. This is critical for entries that contain an
+    # encoded slash (%2F) which many CDNs/proxies normalize into a real '/'.
+    # Example:
+    #   .../CD-i%2Fboot0.rom  ->  .../CD-i/boot0.rom
+    decoded = unquote(p.path).lstrip("/")
+    if not decoded:
         return None
-    return PurePosixPath("_ext", p.netloc, *path.split("/"))
+
+    parts = [seg for seg in decoded.split("/") if seg]
+    if not parts:
+        return None
+
+    return PurePosixPath("_ext", p.netloc, *parts)
 
 
 def mirror_external_file(url: str, dest_path: PurePosixPath) -> None:
